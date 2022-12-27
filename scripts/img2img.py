@@ -156,7 +156,7 @@ def main():
             config = {'model': {'target': 'sd.models.diffusion.StableDiffusionV2'}}
         else:
             config = {'model': {'target': 'sd.models.diffusion.StableDiffusion'}}
-    model = load_model_from_config(config, opt.ckpt, verbose=True, swap_ema=opt.use_ema, no_ema=not opt.use_ema)
+    model = load_model_from_config(config, opt.ckpt, verbose=True, no_ema=True)
 
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     model = model.to(device)

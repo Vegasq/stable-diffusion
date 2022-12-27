@@ -1,15 +1,19 @@
 import argparse, sys, os
 sys.path.append(os.getcwd())
 
+import time
+import uuid
 import torch
 import numpy as np
 from PIL import Image
+from PIL import ExifTags
 from tqdm import tqdm, trange
 from itertools import islice
 from einops import rearrange
 from torchvision.utils import make_grid
 import time
 import yaml
+import datetime
 
 from pytorch_lightning import seed_everything
 from torch import autocast
@@ -20,28 +24,23 @@ from sd.samplers.ddpm import DDPMSampler
 from sd.samplers.ddim import DDIMSampler
 from sd.samplers.plms import PLMSSampler
 
+import random
 
-def main():
+from urllib.request import urlopen
+from bs4 import BeautifulSoup
+
+import random_name
+
+
+def get_opt():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument(
-        '--prompt',
-        type=str,
-        nargs='?',
-        default='a painting of a virus monster playing guitar',
-        help='the prompt to render'
-    )
     parser.add_argument(
         '--outdir',
         type=str,
         nargs='?',
         help='dir to write results to',
         default='outputs/txt2img-samples'
-    )
-    parser.add_argument(
-        '--skip_grid',
-        action='store_true',
-        help='do not save a grid, only individual samples. Helpful when evaluating lots of samples',
     )
     parser.add_argument(
         '--skip_save',
@@ -83,12 +82,6 @@ def main():
         type=int,
         default=4,
         help='how many samples to produce for each given prompt. A.k.a batch size',
-    )
-    parser.add_argument(
-        '--n_rows',
-        type=int,
-        default=0,
-        help='rows in the grid (default: n_samples)',
     )
     parser.add_argument(
         '--scale',
@@ -148,6 +141,11 @@ def main():
         help='Use SD 2.0 model architecture',
     )
     opt = parser.parse_args()
+    return opt
+
+
+def main():
+    opt = get_opt()
 
     if opt.config:
         config = yaml.safe_load(open(opt.config, 'r'))
@@ -162,6 +160,38 @@ def main():
     model = model.to(device)
     model.eval()
 
+    os.makedirs(opt.outdir, exist_ok=True)
+    outpath = opt.outdir
+
+    batch_size = opt.n_samples
+    n_rows = opt.n_rows if opt.n_rows > 0 else batch_size
+
+    data = None
+    if opt.from_file:
+        with open(opt.from_file, 'r') as f:
+            data = f.read().splitlines()
+            data = [batch_size * [prompt] for prompt in data]
+
+    tic = time.time()
+    for i in range(1000):
+        gen(opt, data, model)
+    toc = time.time()
+
+    print(f'Your samples are ready and waiting for you here: \n{outpath} \n'
+          f'Sampling took {toc - tic}s, i.e. produced {opt.n_iter * opt.n_samples / (toc - tic):.2f} samples/sec.'
+          f' \nEnjoy.')
+
+
+def gen(opt, data, model):
+    seed = random.randint(1, 100000)
+    seed_everything(seed)
+
+    if data is None:
+        data = [[random_name.random_name() + ", " + random_name.random_tags()]]
+
+    sample_path = os.path.join(opt.outdir, 'samples', f"{datetime.date.today()}")
+    os.makedirs(sample_path, exist_ok=True)
+
     if opt.sampler == 'ddpm':
         sampler = DDPMSampler(num_timesteps=opt.steps)
     elif opt.sampler == 'ddim':
@@ -171,33 +201,11 @@ def main():
     else:
         raise ValueError(f'Unknown sampler type {opt.sampler}')
 
-    os.makedirs(opt.outdir, exist_ok=True)
-    outpath = opt.outdir
-
-    batch_size = opt.n_samples
-    n_rows = opt.n_rows if opt.n_rows > 0 else batch_size
-    if not opt.from_file:
-        prompt = opt.prompt
-        data = [batch_size * [prompt]]
-    else:
-        print(f'Reading prompts from {opt.from_file}')
-        with open(opt.from_file, 'r') as f:
-            data = f.read().splitlines()
-            data = [batch_size * [prompt] for prompt in data]
-
-    sample_path = os.path.join(outpath, 'samples')
-    os.makedirs(sample_path, exist_ok=True)
-    base_count = len(os.listdir(sample_path))
-    grid_count = len(os.listdir(outpath)) - 1
-
-    seed_everything(opt.seed)
-
     precision_scope = autocast if opt.precision=='autocast' else nullcontext
     with precision_scope('cuda'):
-        tic = time.time()
         for prompts in tqdm(data, desc='data'):
             if opt.same_seed:
-                seed_everything(opt.seed)
+                seed_everything(seed)
                 
             all_samples = list()
             for n in trange(opt.n_iter, desc='Sampling'):
@@ -208,28 +216,12 @@ def main():
                 if not opt.skip_save:
                     for x_sample in x_samples:
                         x_sample = 255 * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
-                        Image.fromarray(x_sample.astype(np.uint8)).save(os.path.join(sample_path, f'{base_count:05}.png'))
-                        base_count += 1
-                
-                if not opt.skip_grid:
-                    all_samples.append(x_samples)
-
-            if not opt.skip_grid:
-                # additionally, save as grid
-                grid = torch.stack(all_samples, 0)
-                grid = rearrange(grid, 'n b c h w -> (n b) c h w')
-                grid = make_grid(grid, nrow=n_rows)
-
-                # to image
-                grid = 255 * rearrange(grid, 'c h w -> h w c').cpu().numpy()
-                Image.fromarray(grid.astype(np.uint8)).save(os.path.join(outpath, f'grid-{grid_count:04}.png'))
-                grid_count += 1
-
-        toc = time.time()
-
-    print(f'Your samples are ready and waiting for you here: \n{outpath} \n'
-          f'Sampling took {toc - tic}s, i.e. produced {opt.n_iter * opt.n_samples / (toc - tic):.2f} samples/sec.'
-          f' \nEnjoy.')
+                        img = Image.fromarray(x_sample.astype(np.uint8))
+                        exif = img.getexif()
+                        exif[ExifTags.Base.ImageDescription] = f"{data[0][0]}"
+                        exif[ExifTags.Base.ImageUniqueID] = f"{seed}"
+                        exif[ExifTags.Base.DateTime] = f"{int(time.time())}"
+                        img.save(os.path.join(sample_path, f'{uuid.uuid4()}.png'), exif=exif)
 
 
 if __name__ == '__main__':
